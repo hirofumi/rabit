@@ -20,7 +20,11 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#ifdef __APPLE__
+#include <sys/event.h>
+#else
 #include <sys/select.h>
+#endif
 #include <sys/ioctl.h>
 #endif
 #include <string>
@@ -423,55 +427,111 @@ class TCPSocket : public Socket{
 struct SelectHelper {
  public:
   SelectHelper(void) {
+#ifdef __APPLE__
+    kq = kqueue();
+    num_pending = 0;
+    num_registered = 0;
+    max_kevs = FD_SETSIZE;
+    kevs = (struct kevent *)malloc(max_kevs * sizeof(struct kevent));
+#else
     FD_ZERO(&read_set);
     FD_ZERO(&write_set);
     FD_ZERO(&except_set);
     maxfd = 0;
+#endif
   }
+#ifdef __APPLE__
+  ~SelectHelper() {
+    free(kevs);
+    close(kq);
+  }
+#endif
   /*!
    * \brief add file descriptor to watch for read
    * \param fd file descriptor to be watched
    */
   inline void WatchRead(SOCKET fd) {
+#ifdef __APPLE__
+    ResizeEventBuffer();
+    EV_SET(&kevs[num_registered++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, 0);
+#else
     FD_SET(fd, &read_set);
     if (fd > maxfd) maxfd = fd;
+#endif
   }
   /*!
    * \brief add file descriptor to watch for write
    * \param fd file descriptor to be watched
    */
   inline void WatchWrite(SOCKET fd) {
+#ifdef __APPLE__
+    ResizeEventBuffer();
+    EV_SET(&kevs[num_registered++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, 0);
+#else
     FD_SET(fd, &write_set);
     if (fd > maxfd) maxfd = fd;
+#endif
   }
   /*!
    * \brief add file descriptor to watch for exception
    * \param fd file descriptor to be watched
    */
   inline void WatchException(SOCKET fd) {
+#ifdef __APPLE__
+    ResizeEventBuffer();
+    EV_SET(&kevs[num_registered++], fd, EVFILT_EXCEPT, EV_ADD | EV_ENABLE, 0, 0, 0);
+#else
     FD_SET(fd, &except_set);
     if (fd > maxfd) maxfd = fd;
+#endif
   }
   /*!
    * \brief Check if the descriptor is ready for read
    * \param fd file descriptor to check status
    */
   inline bool CheckRead(SOCKET fd) const {
+#ifdef __APPLE__
+    for (int i = 0; i < num_pending; ++i) {
+      if (kevs[i].ident == fd && kevs[i].filter == EVFILT_READ) {
+        return kevs[i].flags & ~EV_OOBAND;
+      }
+    }
+    return false;
+#else
     return FD_ISSET(fd, &read_set) != 0;
+#endif
   }
   /*!
    * \brief Check if the descriptor is ready for write
    * \param fd file descriptor to check status
    */
   inline bool CheckWrite(SOCKET fd) const {
+#ifdef __APPLE__
+    for (int i = 0; i < num_pending; ++i) {
+      if (kevs[i].ident == fd && kevs[i].filter == EVFILT_WRITE) {
+        return true;
+      }
+    }
+    return false;
+#else
     return FD_ISSET(fd, &write_set) != 0;
+#endif
   }
   /*!
    * \brief Check if the descriptor has any exception
    * \param fd file descriptor to check status
    */
   inline bool CheckExcept(SOCKET fd) const {
+#ifdef __APPLE__
+    for (int i = 0; i < num_pending; ++i) {
+      if (kevs[i].ident == fd && kevs[i].filter == EVFILT_READ) {
+        return kevs[i].flags & EV_OOBAND;
+      }
+    }
+    return false;
+#else
     return FD_ISSET(fd, &except_set) != 0;
+#endif
   }
   /*!
    * \brief wait for exception event on a single descriptor
@@ -480,11 +540,28 @@ struct SelectHelper {
    * \return 1 if success, 0 if timeout, and -1 if error occurs
    */
   inline static int WaitExcept(SOCKET fd, long timeout = 0) { // NOLINT(*)
+#ifdef __APPLE__
+    int ret;
+    int kq1 = kqueue();
+    struct kevent kev;
+    EV_SET(&kev, fd, EVFILT_EXCEPT, EV_ADD, 0, 0, 0);
+    if (timeout == 0) {
+      ret = kevent(kq1, &kev, 1, &kev, 1, NULL);
+    } else {
+      timespec ts;
+      ts.tv_sec = timeout / 1000;
+      ts.tv_nsec = (timeout % 1000) * 1000000;
+      ret = kevent(kq1, &kev, 1, &kev, 1, &ts);
+    }
+    close(kq1);
+    return ret;
+#else
     fd_set wait_set;
     FD_ZERO(&wait_set);
     FD_SET(fd, &wait_set);
     return Select_(static_cast<int>(fd + 1),
                    NULL, NULL, &wait_set, timeout);
+#endif
   }
   /*!
    * \brief peform select on the set defined
@@ -496,15 +573,43 @@ struct SelectHelper {
    *         return -1 if error occurs
    */
   inline int Select(long timeout = 0) {  // NOLINT(*)
+#ifdef __APPLE__
+    int ret;
+    if (timeout == 0) {
+      ret = kevent(kq, kevs, num_registered, kevs, max_kevs, NULL);
+    } else {
+      timespec ts;
+      ts.tv_sec = timeout / 1000;
+      ts.tv_nsec = (timeout % 1000) * 1000000;
+      ret = kevent(kq, kevs, num_registered, kevs, max_kevs, &ts);
+    }
+    if (ret == -1) {
+      Socket::Error("Select");
+      num_pending = 0;
+    } else {
+      num_pending = ret;
+    }
+    return ret;
+#else
     int ret =  Select_(static_cast<int>(maxfd + 1),
                        &read_set, &write_set, &except_set, timeout);
     if (ret == -1) {
       Socket::Error("Select");
     }
     return ret;
+#endif
   }
 
  private:
+#ifdef __APPLE__
+  inline void ResizeEventBuffer(void) {  // NOLINT(*)
+    if (num_registered < max_kevs) {
+      return;
+    }
+    max_kevs <<= 1;
+    kevs = (struct kevent *)realloc(kevs, max_kevs * sizeof(struct kevent));
+  }
+#else
   inline static int Select_(int maxfd, fd_set *rfds,
                             fd_set *wfds, fd_set *efds, long timeout) { // NOLINT(*)
 #if !defined(_WIN32)
@@ -519,9 +624,19 @@ struct SelectHelper {
       return select(maxfd, rfds, wfds, efds, &tm);
     }
   }
+#endif
 
+#ifdef __APPLE__
+  int kq;
+  size_t num_pending;
+  size_t num_registered;
+  size_t max_kevs;
+  struct kevent *kevs;
+  const struct timespec zero_ = { 0, 0 };
+#else
   SOCKET maxfd;
   fd_set read_set, write_set, except_set;
+#endif
 };
 }  // namespace utils
 }  // namespace rabit
